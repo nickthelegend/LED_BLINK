@@ -1,172 +1,340 @@
-#include <lvgl.h>
-#include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
-#include <ui.h> // your LVGL UI
 #include <WiFi.h>
-#include <ESPSupabaseRealtime.h>
+#include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 
-// ---- WiFi Config ----
-const char* ssid = "JNTU2";
-const char* password = "";
+///////////////////////////
+// WiFi SETTINGS
+///////////////////////////
+#define MYWIFI_SSID "JNTU2"
+#define MYWIFI_PWD   ""
 
-// ---- Supabase Config ----
-const char* supabaseUrl = "uorbdplqtxmcdhbnkbmf.supabase.co";
-const char* supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVvcmJkcGxxdHhtY2RoYm5rYm1mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDI2MjE0MTIsImV4cCI6MjA1ODE5NzQxMn0.Rl-PVPAXXoHYQVnuYl1rZG5PQjxzMCJJCz_uOUL1qiE";
+// WiFi login portal URL
+const char* loginUrl = "http://172.16.7.253:8090/login.xml";
 
-// ---- Pin Config ----
-#define TOUCH_CS 5
-#define TOUCH_IRQ 25
-#define LED_PIN 19  // D19 pin for LED
+///////////////////////////
+// Supabase WebSocket SETTINGS
+///////////////////////////
+const char* supabaseHost = "uorbdplqtxmcdhbnkbmf.supabase.co";
+const int supabasePort = 443;
+const char* supabasePath = "/realtime/v1/websocket?apikey=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVvcmJkcGxxdHhtY2RoYm5rYm1mIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0MjYyMTQxMiwiZXhwIjoyMDU4MTk3NDEyfQ.7jcCez98a57cjrPAv7l_wc-rWin55Y_H80mw-G7swSw&log_level=info&vsn=1.0.0";
 
-// ---- Screen Config ----
-static const uint16_t screenWidth = 320;
-static const uint16_t screenHeight = 240;
+// LED Pin
+#define LED_PIN 19
 
-// Reduce buffer size to save memory
-static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf[screenWidth * 10]; // Reduced from screenHeight/10 to just 10 rows
+// WebSocket client
+WebSocketsClient webSocket;
 
-TFT_eSPI tft = TFT_eSPI(screenWidth, screenHeight);
-XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+// Connection status tracking
+bool wifiAuthenticated = false;
+bool wsConnected = false;
+unsigned long lastWifiCheckTime = 0;
+unsigned long lastHeartbeatTime = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 60000;  // Check WiFi every 60 seconds
+const unsigned long HEARTBEAT_INTERVAL = 30000;   // Send heartbeat every 30 seconds
 
-// Create Supabase Realtime instance
-SupabaseRealtime supabase;
+// Phoenix Channel message counters
+int joinRef = 1;
+int messageRef = 1;
 
-// LED status label
-lv_obj_t *led_status_label = NULL;
-
-// Function to handle incoming Supabase messages
-void handleSupabaseMessage(String message) {
-    
-    // Use a smaller JSON document to save memory
-    StaticJsonDocument<256> doc;
-    DeserializationError error = deserializeJson(doc, message);
-    
-    if (error) {
-        
-        return;
-    }
-    
-    // Check if this is a broadcast message
-    if (doc["type"] == "broadcast") {
-        String event = doc["event"];
-        
-        if (event == "ledOn") {
-            // Turn on the LED
-            digitalWrite(LED_PIN, HIGH);
-            
-            // Update UI if label exists
-            if (led_status_label) {
-                lv_label_set_text(led_status_label, "LED: ON");
-                lv_obj_set_style_text_color(led_status_label, lv_color_make(0, 255, 0), LV_PART_MAIN);
-            }
-        } 
-        else if (event == "ledOff") {
-            // Turn off the LED
-            digitalWrite(LED_PIN, LOW);
-            
-            // Update UI if label exists
-            if (led_status_label) {
-                lv_label_set_text(led_status_label, "LED: OFF");
-                lv_obj_set_style_text_color(led_status_label, lv_color_make(255, 0, 0), LV_PART_MAIN);
-            }
-        }
-    }
+// Function to connect to WiFi
+bool connectToWiFi() {
+  Serial.printf("Connecting to %s...\n", MYWIFI_SSID);
+  WiFi.begin(MYWIFI_SSID, MYWIFI_PWD);
+  
+  // Wait for connection with timeout
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  } else {
+    Serial.println("\nFailed to connect to WiFi");
+    return false;
+  }
 }
 
-void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t w = (area->x2 - area->x1 + 1);
-    uint32_t h = (area->y2 - area->y1 + 1);
+// Function to authenticate with WiFi portal
+bool authenticateWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  
+  HTTPClient http;
+  http.begin(loginUrl);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("Accept", "*/*");
+  http.addHeader("Accept-Language", "en-US,en;q=0.8");
+  http.addHeader("Referer", "http://172.16.7.253:8090/httpclient.html");
+  http.addHeader("Referrer-Policy", "strict-origin-when-cross-origin");
 
-    tft.startWrite();
-    tft.setAddrWindow(area->x1, area->y1, w, h);
-    tft.pushColors((uint16_t *)&color_p->full, w * h, true);
-    tft.endWrite();
+  // Prepare URL-encoded body
+  String postData = "mode=191";
+  postData += "&username=16011A0552";
+  postData += "&password=jntu12345";
+  postData += "&a=" + String(millis());  // Dynamic timestamp
+  postData += "&producttype=0";
 
-    lv_disp_flush_ready(disp);
-}
+  // Send POST request
+  Serial.println("Sending WiFi authentication request...");
+  int httpResponseCode = http.POST(postData);
 
-void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
-    if (ts.touched()) {
-        TS_Point p = ts.getPoint();
-        data->point.x = map(p.x, 200, 3900, 0, screenWidth);
-        data->point.y = map(p.y, 200, 3900, 0, screenHeight);
-        data->state = LV_INDEV_STATE_PR;
+  // Check response
+  bool success = false;
+  if (httpResponseCode > 0) {
+    Serial.printf("HTTP Response code: %d\n", httpResponseCode);
+    String payload = http.getString();
+    Serial.println("Response payload:");
+    Serial.println(payload);
+    
+    // Check if authentication was successful
+    // You may need to adjust this condition based on the actual response
+    if (httpResponseCode == 200) {
+      Serial.println("WiFi authentication successful!");
+      success = true;
     } else {
-        data->state = LV_INDEV_STATE_REL;
+      Serial.println("WiFi authentication failed!");
     }
+  } else {
+    Serial.printf("Error on sending POST: %s\n", http.errorToString(httpResponseCode).c_str());
+  }
+
+  // End connection
+  http.end();
+  return success;
+}
+
+// Function to handle WebSocket events
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WSc] Disconnected!");
+      wsConnected = false;
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.println("[WSc] Connected to Supabase Realtime!");
+      wsConnected = true;
+      
+      // Subscribe to the ledState channel
+      subscribeToLedStateChannel();
+      break;
+      
+    case WStype_TEXT:
+      handleWebSocketMessage(payload, length);
+      break;
+      
+    case WStype_ERROR:
+      Serial.println("[WSc] Connection error!");
+      break;
+      
+    case WStype_PING:
+      // Automatically sends pong in response to ping
+      Serial.println("[WSc] Received ping");
+      break;
+      
+    case WStype_PONG:
+      Serial.println("[WSc] Received pong");
+      break;
+  }
+}
+
+// Function to subscribe to the ledState channel
+void subscribeToLedStateChannel() {
+  // Create the Phoenix Channel join message
+  StaticJsonDocument<512> doc;
+  
+  doc["topic"] = "realtime:ledState";
+  doc["event"] = "phx_join";
+  doc["join_ref"] = String(joinRef);
+  doc["ref"] = String(messageRef);
+  
+  JsonObject payload = doc.createNestedObject("payload");
+  JsonObject config = payload.createNestedObject("config");
+  
+  JsonObject broadcast = config.createNestedObject("broadcast");
+  broadcast["self"] = true;
+  
+  JsonObject presence = config.createNestedObject("presence");
+  presence["key"] = "";
+  
+  // Serialize to JSON string
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  // Send the subscription message
+  Serial.println("[WSc] Subscribing to ledState channel...");
+  Serial.println(jsonString);
+  webSocket.sendTXT(jsonString);
+  
+  // Increment message reference counters
+  joinRef++;
+  messageRef++;
+}
+
+// Function to send heartbeat to keep the connection alive
+void sendHeartbeat() {
+  // Create the Phoenix Channel heartbeat message
+  StaticJsonDocument<256> doc;
+  
+  doc["topic"] = "phoenix";
+  doc["event"] = "heartbeat";
+  doc["join_ref"] = String(joinRef);
+  doc["ref"] = String(messageRef);
+  
+  JsonObject payload = doc.createNestedObject("payload");
+  
+  // Serialize to JSON string
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  // Send the heartbeat message
+  Serial.println("[WSc] Sending heartbeat...");
+  webSocket.sendTXT(jsonString);
+  
+  // Increment message reference counter
+  messageRef++;
+}
+
+// Function to handle incoming WebSocket messages
+void handleWebSocketMessage(uint8_t * payload, size_t length) {
+  // Convert payload to string
+  String message = String((char*)payload);
+  Serial.println("[WSc] Received: " + message);
+  
+  // Parse the JSON message
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, message);
+  
+  if (error) {
+    Serial.print("JSON parsing error: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  // Check if this is a broadcast message
+  String event = doc["event"];
+  
+  if (event == "broadcast") {
+    // Extract the payload
+    JsonObject broadcastPayload = doc["payload"];
+    
+    // Check the event type in the payload
+    if (broadcastPayload.containsKey("event")) {
+      String eventName = broadcastPayload["event"];
+      
+      if (eventName == "ledOn") {
+        // Turn on the LED
+        digitalWrite(LED_PIN, HIGH);
+        Serial.println("LED turned ON");
+      } 
+      else if (eventName == "ledOff") {
+        // Turn off the LED
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned OFF");
+      }
+    }
+  }
+  // Check if this is a reply to our join request
+  else if (event == "phx_reply") {
+    JsonObject replyPayload = doc["payload"];
+    String status = replyPayload["status"];
+    
+    if (status == "ok") {
+      Serial.println("Successfully joined ledState channel!");
+    } else {
+      Serial.println("Failed to join ledState channel!");
+    }
+  }
+}
+
+// Function to setup WebSocket connection
+void setupWebSocket() {
+  Serial.println("Setting up WebSocket connection to Supabase...");
+  
+  // Use beginSSL for secure WebSocket connections (wss://)
+  webSocket.beginSSL(supabaseHost, supabasePort, supabasePath);
+  
+
+  
+  // Set the callback function
+  webSocket.onEvent(webSocketEvent);
+  
+  // Try to reconnect every 5000ms if connection has failed
+  webSocket.setReconnectInterval(5000);
+  
+  Serial.println("WebSocket connection initialized");
 }
 
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println(F("\n\n----- ESP32 WiFi Login & LED Controller (Direct WebSocket) -----"));
+  
+  // Initialize LED pin
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println(F("LED initialized on pin 19"));
+  
+  // Connect to WiFi
+  if (connectToWiFi()) {
+    // Authenticate with WiFi portal
+    wifiAuthenticated = authenticateWiFi();
     
-    // Initialize LED pin
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
-    
-    // Connect to WiFi
-    WiFi.begin(ssid, password);
-    
-    // Initialize LVGL
-    lv_init();
-    tft.begin();
-    tft.setRotation(1);
-    ts.begin();
-    ts.setRotation(1);
-    
-    // Use a smaller buffer to save memory
-    lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
-
-    static lv_disp_drv_t disp_drv;
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = screenWidth;
-    disp_drv.ver_res = screenHeight;
-    disp_drv.flush_cb = my_disp_flush;
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
-
-    static lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = my_touchpad_read;
-    lv_indev_drv_register(&indev_drv);
-
-    ui_init(); // your LVGL GUI init
-    
-    // Create LED status label
-    led_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(led_status_label, "LED: OFF");
-    lv_obj_set_style_text_color(led_status_label, lv_color_make(255, 0, 0), LV_PART_MAIN);
-    lv_obj_align(led_status_label, LV_ALIGN_TOP_RIGHT, -10, 10);
-    
-    // Wait for WiFi connection
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        // Serial.print(".");
-        attempts++;
+    if (wifiAuthenticated) {
+      // Setup WebSocket connection
+      setupWebSocket();
     }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        
-        // Initialize Supabase
-        supabase.begin(supabaseUrl, supabaseKey, handleSupabaseMessage);
-        supabase.addChangesListener("messages", "*", "public", "");
-        supabase.listen();
-        
-    } else {
-    }
+  }
 }
 
 void loop() {
-    // Handle LVGL tasks
-    lv_timer_handler();
+  unsigned long currentMillis = millis();
+  
+  // Check WiFi connection periodically
+  if (currentMillis - lastWifiCheckTime > WIFI_CHECK_INTERVAL) {
+    lastWifiCheckTime = currentMillis;
     
-    // Handle Supabase Realtime tasks
-    if (WiFi.status() == WL_CONNECTED) {
-        supabase.loop();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("WiFi disconnected, reconnecting..."));
+      wifiAuthenticated = false;
+      wsConnected = false;
+      
+      if (connectToWiFi()) {
+        wifiAuthenticated = authenticateWiFi();
+        
+        if (wifiAuthenticated) {
+          setupWebSocket();
+        }
+      }
+    } else if (!wifiAuthenticated) {
+      // Try to authenticate if connected but not authenticated
+      wifiAuthenticated = authenticateWiFi();
+      
+      if (wifiAuthenticated && !wsConnected) {
+        setupWebSocket();
+      }
     }
+  }
+  
+  // Handle WebSocket connection
+  if (WiFi.status() == WL_CONNECTED && wifiAuthenticated) {
+    webSocket.loop();
     
-    delay(5);
+    // Send heartbeat periodically to keep the connection alive
+    if (wsConnected && (currentMillis - lastHeartbeatTime > HEARTBEAT_INTERVAL)) {
+      lastHeartbeatTime = currentMillis;
+      sendHeartbeat();
+    }
+  }
+  
+  // Small delay to prevent CPU hogging
+  delay(10);
 }
